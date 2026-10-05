@@ -18,7 +18,10 @@
   }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html { color-scheme: light dark; }
-  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,"Noto Sans JP",sans-serif; font-size:15px; }
+  /* 長押しで、文字が選択されたり、メニューが出たりしないようにする(完成した画像の長押し保存は、そのまま使える) */
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,"Noto Sans JP",sans-serif; font-size:15px;
+         -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  #out { -webkit-user-select:auto; user-select:auto; -webkit-touch-callout:default; }
   body.hasbar .page { padding-bottom:calc(88px + env(safe-area-inset-bottom, 0px)); }
   /* 左右の余白を広めにとる(Androidの、画面の端から内側へのスワイプ=「戻る」操作と、ぶつからないように) */
   .page { max-width:560px; margin:0 auto; padding:12px 24px 24px; }
@@ -56,8 +59,10 @@
   /* プレビュー(手順2〜5で上に固定) */
   .preview { position:sticky; top:0; z-index:10; background:var(--bg); padding:6px 0 10px; border-bottom:1px solid var(--line); }
   .stagewrap { display:flex; justify-content:center; }
-  .stage { position:relative; background:#000; border-radius:10px; overflow:hidden; }
-  .stage video { width:100%; height:100%; display:block; object-fit:fill; }
+  /* 長押しで、メニュー(動画のダウンロードなど)が出ないようにする */
+  .stage { position:relative; background:#000; border-radius:10px; overflow:hidden;
+           -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+  .stage video { width:100%; height:100%; display:block; object-fit:fill; pointer-events:none; }
   .holdtag { position:absolute; top:8px; right:8px; padding:4px 10px; border-radius:14px; background:rgba(0,0,0,.65); color:#fff;
              font-size:13px; font-weight:700; pointer-events:none; }
   .times { display:flex; justify-content:space-between; align-items:center; gap:8px; font-variant-numeric:tabular-nums; font-size:14px; color:var(--sub); margin-top:6px; }
@@ -300,7 +305,7 @@
   <!-- 6. 完成 -->
   <section id="s6" class="hidden">
     <img id="out" alt="生成したGIF">
-    <div class="hint">画像を長押しして保存してください。<span id="sizeLabel"></span></div>
+    <div class="hint" style="text-align:center;">画像を長押しして保存してください。<br><span id="sizeLabel"></span></div>
     <div id="resMsg" class="info" style="margin-top:8px;"></div>
   </section>
 </div>
@@ -431,6 +436,7 @@
     vh = video.videoHeight;
     startT = 0;
     endT = duration;
+    rangeLen = duration;
     curT = 0;
     crop = { x: 0, y: 0, w: vw, h: vh };
     ratioKey = null; setChipOn('ratioChips', 'ratio', '');
@@ -563,13 +569,25 @@
     scheduleRender();
   }
 
+  // 開始位置を動かす。終了を超えるときは、終了も一緒に後ろへ動かす(範囲の長さは保つ)
+  var rangeLen = 0;   // 押し出しのときに保つ、範囲の長さ
+  function setStartT(t) {
+    var s = clamp(t, 0, duration - MIN_LEN);
+    if (s > endT - MIN_LEN) {
+      endT = Math.min(duration, s + Math.max(MIN_LEN, rangeLen));
+      s = Math.min(s, endT - MIN_LEN);
+    }
+    startT = s;
+    if (endT - startT >= rangeLen || endT < duration) rangeLen = Math.max(MIN_LEN, endT - startT);
+  }
   // role: play / start / end の位置を変更し、その位置をプレビューに出す
   function applyPos(role, t) {
     if (role === 'start') {
-      startT = clamp(t, 0, endT - MIN_LEN);
+      setStartT(t);
       seekVideo(startT);
     } else if (role === 'end') {
       endT = clamp(t, startT + MIN_LEN, duration);
+      rangeLen = endT - startT;
       seekVideo(endT);
     } else {
       seekVideo(clamp(t, 0, duration));
@@ -651,11 +669,7 @@
   $('setStart').addEventListener('click', function () {
     if (busy) return;
     stopPlay();
-    if (curT >= endT - MIN_LEN) {
-      $('trimMsg').textContent = '開始は、終了より前の位置にしてください。';
-      return;
-    }
-    startT = curT;
+    setStartT(curT);   // 終了を超える場合は、終了も後ろへ動かす
     render();
   });
   $('setEnd').addEventListener('click', function () {
@@ -666,6 +680,7 @@
       return;
     }
     endT = curT;
+    rangeLen = endT - startT;
     render();
   });
 
@@ -929,6 +944,15 @@
     }
     updateCropUI();
   });
+  // 長押しで出るメニュー(動画の保存、全選択など)を出さない。完成した画像だけは、長押しで保存できるように残す
+  document.addEventListener('contextmenu', function (e) {
+    if (e.target && e.target.id === 'out') return;
+    e.preventDefault();
+  });
+  document.addEventListener('selectstart', function (e) {
+    if (e.target && e.target.id === 'out') return;
+    e.preventDefault();
+  });
   // 指を離したとき: 動かしていなければ「タップ」として、再生・停止を切り替える
   // 長押しの2倍再生を終える(指を離したら、再生中でも停止中でも、止める)
   function endHold(s) {
@@ -1169,8 +1193,10 @@
       if (resultUrl) URL.revokeObjectURL(resultUrl);
       resultUrl = URL.createObjectURL(blob);
       $('out').src = resultUrl;
-      $('sizeLabel').textContent = '(' + w + '×' + h + ' px / ' + fps + 'コマ/秒 / 速度 ×' + spd +
-        ' / 約 ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB)';
+      // 区切りのよい場所で改行されるように、項目ごとにまとめる
+      var nw = function (s) { return '<span style="white-space:nowrap;">' + s + '</span>'; };
+      $('sizeLabel').innerHTML = [nw(w + '×' + h + ' px'), nw(fps + 'コマ/秒'), nw('速度 ×' + spd),
+        nw('約 ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB')].join(' / ');
       $('resMsg').innerHTML = firstBlack
         ? '<span class="warn">先頭のフレームが真っ黒でした。動画のフレームを取得できていない可能性があります(Firefoxでは、フィンガープリント保護により取得できないことがあります。Chromeでお試しください)。</span>'
         : '';
