@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>動画GIF作成</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --text:#1f2933; --sub:#6b7280; --accent:#2563eb; --warn:#b45309; --err:#b91c1c; --line:#d1d5db; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:12px; background:var(--bg); color:var(--text); font-family:-apple-system,"Noto Sans JP",sans-serif; font-size:15px; }
+  h1 { font-size:18px; margin:0 0 10px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .card h2 { font-size:14px; margin:0 0 8px; color:var(--sub); }
+  video { width:100%; max-height:45vh; background:#000; border-radius:6px; display:block; }
+  input[type=range] { width:100%; margin:10px 0 4px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:8px; }
+  .row > * { flex:1 1 auto; }
+  button { min-height:44px; padding:0 12px; border:1px solid var(--line); border-radius:8px; background:#fff; font-size:15px; color:var(--text); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:bold; }
+  button:disabled { opacity:.5; }
+  input[type=number] { width:100%; min-height:44px; padding:0 8px; font-size:16px; border:1px solid var(--line); border-radius:8px; }
+  label { font-size:14px; }
+  .time { font-variant-numeric: tabular-nums; font-size:14px; display:flex; justify-content:space-between; color:var(--sub); }
+  .info { font-size:14px; line-height:1.6; }
+  .warn { color:var(--warn); }
+  .err { color:var(--err); }
+  .hint { font-size:13px; color:var(--sub); margin-top:6px; }
+  #result img { width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:6px; }
+  .hidden { display:none; }
+  progress { width:100%; height:14px; }
+</style>
+</head>
+<body>
+<h1>動画GIF作成</h1>
+
+<div class="card">
+  <h2>1. 動画を選択</h2>
+  <input type="file" id="file" accept="video/*">
+  <div class="hint">動画は端末内だけで処理され、外部には送信されません。</div>
+</div>
+
+<div id="editor" class="hidden">
+  <div class="card">
+    <h2>2. 開始・終了を設定</h2>
+    <video id="video" playsinline muted preload="auto"></video>
+    <input type="range" id="seek" min="0" max="1" step="0.001" value="0">
+    <div class="time"><span id="curLabel">現在 0.00s</span><span id="durLabel">全体 0.00s</span></div>
+    <div class="row">
+      <button id="prev">-1フレーム</button>
+      <button id="next">+1フレーム</button>
+    </div>
+    <div class="row">
+      <button id="setStart">現在位置を開始に</button>
+      <button id="setEnd">現在位置を終了に</button>
+    </div>
+    <div class="info" style="margin-top:10px;">
+      開始 <b id="startLabel">0.00s</b> / 終了 <b id="endLabel">0.00s</b> / 長さ <b id="lenLabel">0.00s</b>
+      <div id="rangeMsg"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. サイズ</h2>
+    <div class="row">
+      <div><label>横幅(px)<input type="number" id="w" min="16" max="1920"></label></div>
+      <div><label>縦幅(px)<input type="number" id="h" min="16" max="1920"></label></div>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="lock" checked> 縦横比を固定</label>
+    </div>
+    <div class="hint">サイズが大きいほど、生成に時間がかかり容量も増えます。</div>
+  </div>
+
+  <div class="card">
+    <h2>4. GIF生成(30fps)</h2>
+    <button id="gen" class="primary" style="width:100%;">GIFを生成</button>
+    <div style="margin-top:10px;">
+      <progress id="prog" value="0" max="100" class="hidden"></progress>
+      <div id="status" class="info"></div>
+    </div>
+    <div id="result" class="hidden" style="margin-top:10px;">
+      <img id="out" alt="生成したGIF">
+      <div class="hint">画像を長押しして保存してください。<span id="sizeLabel"></span></div>
+    </div>
+  </div>
+</div>
+
+<canvas id="canvas" class="hidden"></canvas>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js"></script>
+<script>
+(function () {
+  var FPS = 30;
+  var WARN_SEC = 10;
+  var PLAY_RATE = 0.5;
+  var WORKER_URL = 'https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var video = $('video'), seek = $('seek'), canvas = $('canvas');
+  var startT = 0, endT = 0, duration = 0, ratio = 1, vw = 0, vh = 0;
+  var videoUrl = null, resultUrl = null, workerBlobUrl = null, busy = false;
+  var firstShot = null, captureNote = '';
+
+  function fmt(t) { return t.toFixed(2) + 's'; }
+  function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
+
+  // ---- 動画読み込み ----
+  $('file').addEventListener('change', function (e) {
+    var f = e.target.files && e.target.files[0];
+    if (!f) return;
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    videoUrl = URL.createObjectURL(f);
+    $('editor').classList.add('hidden');
+    $('result').classList.add('hidden');
+    $('status').textContent = '';
+    video.src = videoUrl;
+    video.load();
+  });
+
+  video.addEventListener('loadedmetadata', function () {
+    duration = video.duration;
+    vw = video.videoWidth;
+    vh = video.videoHeight;
+    ratio = vw / vh;
+    seek.max = duration;
+    seek.value = 0;
+    startT = 0;
+    endT = duration;
+    var w0 = Math.min(vw, 480);
+    $('w').value = w0;
+    $('h').value = Math.round(w0 / ratio);
+    $('durLabel').textContent = '全体 ' + fmt(duration);
+    $('editor').classList.remove('hidden');
+    updateLabels();
+  });
+
+  video.addEventListener('error', function () {
+    if (!video.getAttribute('src')) return;
+    $('editor').classList.add('hidden');
+    $('status').innerHTML = '<span class="err">この動画を読み込めませんでした。別の形式でお試しください。</span>';
+  });
+
+  // ---- シーク ----
+  seek.addEventListener('input', function () {
+    video.currentTime = parseFloat(seek.value);
+  });
+  video.addEventListener('seeked', function () {
+    seek.value = video.currentTime;
+    $('curLabel').textContent = '現在 ' + fmt(video.currentTime);
+  });
+  function step(d) {
+    video.currentTime = clamp(video.currentTime + d / FPS, 0, duration);
+  }
+  $('prev').addEventListener('click', function () { step(-1); });
+  $('next').addEventListener('click', function () { step(1); });
+
+  // ---- 開始・終了 ----
+  $('setStart').addEventListener('click', function () {
+    startT = video.currentTime;
+    if (startT >= endT) endT = duration;
+    updateLabels();
+  });
+  $('setEnd').addEventListener('click', function () {
+    var c = video.currentTime;
+    if (c <= startT) {
+      $('rangeMsg').innerHTML = '<span class="err">終了は開始より後の位置を指定してください。</span>';
+      return;
+    }
+    endT = c;
+    updateLabels();
+  });
+
+  function updateLabels() {
+    var len = endT - startT;
+    $('startLabel').textContent = fmt(startT);
+    $('endLabel').textContent = fmt(endT);
+    $('lenLabel').textContent = fmt(len);
+    $('curLabel').textContent = '現在 ' + fmt(video.currentTime || 0);
+    if (len > WARN_SEC) {
+      $('rangeMsg').innerHTML = '<span class="warn">' + WARN_SEC + '秒を超えています。生成に時間がかかり、端末のメモリ不足で失敗する場合があります。</span>';
+    } else {
+      $('rangeMsg').textContent = '';
+    }
+  }
+
+  // ---- サイズ ----
+  $('w').addEventListener('input', function () {
+    if ($('lock').checked) {
+      var w = parseInt($('w').value, 10);
+      if (w > 0) $('h').value = Math.round(w / ratio);
+    }
+  });
+  $('h').addEventListener('input', function () {
+    if ($('lock').checked) {
+      var h = parseInt($('h').value, 10);
+      if (h > 0) $('w').value = Math.round(h * ratio);
+    }
+  });
+  $('lock').addEventListener('change', function () {
+    if ($('lock').checked) {
+      var w = parseInt($('w').value, 10);
+      if (w > 0) $('h').value = Math.round(w / ratio);
+    }
+  });
+
+  // ---- GIF生成 ----
+  function seekTo(t) {
+    return new Promise(function (resolve) {
+      if (Math.abs(video.currentTime - t) < 0.0005) { resolve(); return; }
+      var done = false;
+      function finish() {
+        if (done) return;
+        done = true;
+        video.removeEventListener('seeked', finish);
+        resolve();
+      }
+      video.addEventListener('seeked', finish);
+      setTimeout(finish, 3000);
+      video.currentTime = t;
+    });
+  }
+
+  // 一部のAndroidでは、シークしただけの動画をキャンバスに描くと真っ黒になる。
+  // そのため範囲を低速で実際に再生し、届いたフレームを順に取り込む。
+  // 30fpsの各時刻には、その時刻以前で最も新しいフレームを割り当てる。
+  function captureFrames(ctx, w, h, gif, n, onFrame) {
+    return new Promise(function (resolve, reject) {
+      var i = 0, prevCs = 0, haveFrame = false, firstBlack = false;
+      var finished = false, lastCb = Date.now(), lastRaf = -1;
+      var timer = null, useBitmap = false;
+
+      // 30fpsは33.3msのため、1/100秒単位で 3,3,4 のように配分して平均を合わせる
+      function emit() {
+        var cs = Math.round((i + 1) * 100 / FPS);
+        gif.addFrame(canvas, { copy: true, delay: (cs - prevCs) * 10 });
+        prevCs = cs;
+        i++;
+        onFrame(i);
+      }
+      function onEnded() { end(); }
+      function end(err) {
+        if (finished) return;
+        finished = true;
+        clearInterval(timer);
+        video.removeEventListener('ended', onEnded);
+        video.pause();
+        video.playbackRate = 1;
+        if (err) { reject(err); return; }
+        while (haveFrame && i < n) emit();
+        resolve(firstBlack);
+      }
+      function handle(m) {
+        lastCb = Date.now();
+        // 新しいフレームが来る前の時刻分は、直前のフレームで確定させる
+        while (haveFrame && i < n && startT + i / FPS < m) emit();
+        drawFrame().then(function () {
+          if (finished) return;
+          if (i >= n || m >= endT) end(); else schedule();
+        });
+      }
+      // 直接描画で空(黒)になる端末では、createImageBitmap経由に切り替える
+      function drawFrame() {
+        if (useBitmap) return drawBitmap();
+        ctx.drawImage(video, 0, 0, w, h);
+        if (haveFrame) return Promise.resolve();
+        haveFrame = true;
+        firstBlack = isBlack(ctx, w, h);
+        captureNote = '直接描画';
+        if (!firstBlack || !window.createImageBitmap) { snap(); return Promise.resolve(); }
+        return drawBitmap().then(function () {
+          var bl = isBlack(ctx, w, h);
+          if (!bl) { useBitmap = true; firstBlack = false; captureNote = 'ImageBitmap経由(直接描画は空でした)'; }
+          else { captureNote = '直接描画・ImageBitmapとも空'; }
+          snap();
+        });
+      }
+      function drawBitmap() {
+        return createImageBitmap(video).then(function (b) {
+          ctx.drawImage(b, 0, 0, w, h);
+          if (b.close) b.close();
+        }, function () {
+          ctx.drawImage(video, 0, 0, w, h);
+        });
+      }
+      function snap() {
+        try { firstShot = canvas.toDataURL('image/png'); } catch (e) { firstShot = null; }
+      }
+      function schedule() {
+        if (video.requestVideoFrameCallback) {
+          video.requestVideoFrameCallback(function (now, meta) {
+            if (!finished) handle(meta.mediaTime);
+          });
+        } else {
+          requestAnimationFrame(function poll() {
+            if (finished) return;
+            var t = video.currentTime;
+            if (t !== lastRaf) { lastRaf = t; handle(t); } else { requestAnimationFrame(poll); }
+          });
+        }
+      }
+
+      video.addEventListener('ended', onEnded);
+      timer = setInterval(function () {
+        if (Date.now() - lastCb > 8000) {
+          end(new Error('動画のフレームを取得できません。再生が進んでいない可能性があります。'));
+        }
+      }, 1000);
+      video.playbackRate = PLAY_RATE;
+      schedule();
+      var p = video.play();
+      if (p && p.catch) p.catch(function (e) { end(e); });
+    });
+  }
+
+  // 描画したフレームが完全に真っ黒かどうか(中央付近の一部をサンプリング)
+  function isBlack(ctx, w, h) {
+    try {
+      var sw = Math.min(w, 64), sh = Math.min(h, 64);
+      var d = ctx.getImageData(Math.floor((w - sw) / 2), Math.floor((h - sh) / 2), sw, sh).data;
+      for (var i = 0; i < d.length; i += 4) {
+        if (d[i] > 8 || d[i + 1] > 8 || d[i + 2] > 8) return false;
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function getWorkerUrl() {
+    if (workerBlobUrl) return Promise.resolve(workerBlobUrl);
+    return fetch(WORKER_URL)
+      .then(function (r) {
+        if (!r.ok) throw new Error('worker取得失敗: ' + r.status);
+        return r.text();
+      })
+      .then(function (code) {
+        workerBlobUrl = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+        return workerBlobUrl;
+      });
+  }
+
+  function setBusy(b) {
+    busy = b;
+    ['gen', 'prev', 'next', 'setStart', 'setEnd', 'file', 'w', 'h', 'lock'].forEach(function (id) { $(id).disabled = b; });
+    seek.disabled = b;
+  }
+
+  $('gen').addEventListener('click', function () {
+    if (busy) return;
+    var w = parseInt($('w').value, 10);
+    var h = parseInt($('h').value, 10);
+    if (!(w >= 16 && h >= 16 && w <= 1920 && h <= 1920)) {
+      $('status').innerHTML = '<span class="err">縦横のサイズを16px以上1920px以下で指定してください。</span>';
+      return;
+    }
+    if (endT - startT <= 0) {
+      $('status').innerHTML = '<span class="err">開始と終了の範囲が不正です。</span>';
+      return;
+    }
+    generate(w, h).catch(fail);
+  });
+
+  function fail(err) {
+    var span = document.createElement('span');
+    span.className = 'err';
+    span.textContent = 'エラー: ' + (err && err.message ? err.message : err);
+    $('status').textContent = '';
+    $('status').appendChild(span);
+    $('prog').classList.add('hidden');
+    setBusy(false);
+  }
+
+  async function generate(w, h) {
+    setBusy(true);
+    $('result').classList.add('hidden');
+    var prog = $('prog');
+    prog.classList.remove('hidden');
+    prog.value = 0;
+    $('status').textContent = '準備中...';
+
+    var workerUrl = await getWorkerUrl();
+    canvas.width = w;
+    canvas.height = h;
+    var ctx = canvas.getContext('2d');
+
+    var gif = new GIF({
+      workers: 2,
+      quality: 10,
+      width: w,
+      height: h,
+      workerScript: workerUrl
+    });
+
+    var n = Math.max(1, Math.floor((endT - startT) * FPS));
+
+    await seekTo(startT);
+    // 先頭が黒いだけなら暗い場面の可能性もあるため、中断せず続行して後で通知する
+    var firstBlack = await captureFrames(ctx, w, h, gif, n, function (done) {
+      prog.value = Math.round(done / n * 50);
+      $('status').textContent = 'フレーム取得中 ' + done + ' / ' + n + '(画面はそのままにしてください)';
+    });
+
+    $('status').textContent = 'GIFにエンコード中...';
+
+    // 進捗が一定時間止まったら失敗とみなす(Worker起動失敗などで固まるのを防ぐ)
+    var watchdog = null;
+    function arm() {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(function () {
+        try { gif.abort(); } catch (e) {}
+        fail(new Error('エンコードが進みません。Workerが起動できていない可能性があります。'));
+      }, 30000);
+    }
+    arm();
+    gif.on('progress', function (p) {
+      arm();
+      prog.value = 50 + Math.round(p * 50);
+    });
+    gif.on('abort', function () { clearTimeout(watchdog); });
+    gif.on('finished', function (blob) {
+      clearTimeout(watchdog);
+      if (resultUrl) URL.revokeObjectURL(resultUrl);
+      resultUrl = URL.createObjectURL(blob);
+      $('out').src = resultUrl;
+      $('sizeLabel').textContent = '(約 ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB)';
+      $('result').classList.remove('hidden');
+      $('status').textContent = firstBlack
+        ? '完了しましたが、先頭のフレームが真っ黒でした。動画のフレームを取得できていない可能性があります。'
+        : '完了しました。';
+      // 診断用: キャンバスに最初に取り込めたフレームを表示する(黒の原因の切り分け用)
+      var dbg = document.createElement('div');
+      dbg.className = 'hint';
+      dbg.textContent = '[診断] 取り込み直後の先頭フレーム(下の小さい画像)/ 動画 ' + vw + '×' + vh +
+        ' / 出力 ' + w + '×' + h + ' / 黒判定=' + firstBlack + ' / 取り込み方法=' + captureNote;
+      $('status').appendChild(dbg);
+      if (firstShot) {
+        var im = document.createElement('img');
+        im.src = firstShot;
+        im.style.cssText = 'width:120px;height:auto;border:1px solid #d1d5db;margin-top:4px;background:#888;';
+        $('status').appendChild(im);
+      }
+      prog.classList.add('hidden');
+      setBusy(false);
+    });
+    try {
+      gif.render();
+    } catch (e) {
+      clearTimeout(watchdog);
+      throw e;
+    }
+  }
+})();
+</script>
+</body>
+</html>
